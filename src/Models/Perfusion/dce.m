@@ -51,12 +51,12 @@ end
         MRIinputs = {'DCEData','T1Map','MaskAIF','B1Map','Mask'}; % used in the data panel 
         
         % fitting options
-        xnames = {'KTrans','Ve','Vb', 'T1'}; % name of the fitted parameters
+        xnames = {'KTrans','Ve','Vb', 'T1','S0'}; % name of the fitted parameters
         voxelwise = 1; % 1--> input data in method 'fit' is 1D (vector). 0--> input data in method 'fit' is 4D.
-        st           = [ 0.05	0.2 0.02 1000]; % starting point
-        lb            = [  0      0  0 0]; % lower bound
-        ub           = [ 100 10 10 5000 ]; % upper bound
-        fx            = [ 0       0       0       1 ]; % fix parameters
+        st           = [ 0.05	0.2 0.02 1000 1e3]; % starting point
+        lb            = [  0      0  0 0 0]; % lower bound
+        ub           = [ 100 10 10 5000 1e10]; % upper bound
+        fx            = [ 0       0       0       1  1]; % fix parameters
         
         % Protocol
 %         qibaV4_M0 = 1e3*ones(1,qibaV4_nFrames);
@@ -71,10 +71,9 @@ end
             'Mat',[0.45; 1; 4.5]')); %default protocol for QIBA_v4 phantom
         
         aif = [];
-        conc = [];
         
         % Model options
-        buttons = {'concetration',{'Linear','Non-linear'},'method',{'Patlak','Tofts','Extended Tofts'}}; %selection buttons
+        buttons = {'concetration',{'Non-linear'},'method',{'Extended Tofts'}}; %selection buttons
         options= struct();
         
     end
@@ -85,9 +84,13 @@ end
             obj.options = button2opts(obj.buttons); % converts buttons values to option structure
         end
         function obj = UpdateFields(obj)
+            % T1 and S0 are fixed
             obj.fx(4) = 1;
+            obj.fx(5) = 1;
         end
         function obj = PrecomputeData(obj,data)
+            
+            % PrecomputeAIF from provided mask
             if ~isfield(data, 'B1Map'), data.B1Map = []; end
             
             flipAngle = obj.Prot.SeqParam.Mat(1,1); % degrees
@@ -95,52 +98,35 @@ end
             
             relaxivity1 = obj.Prot.Constants.Mat(1,2);
             
-            [obj.conc, obj.aif] = ...
-                concandaif(data.DCEData, flipAngle, TR, data.T1Map, ...
-                data.MaskAIF, relaxivity1, data.B1Map);
+            concOfAifVoxels = ConcFromSignal_SPGR(data.DCEData, flipAngle, TR, data.T1Map, ...
+                relaxivity1, data.B1Map, data.MaskAIF);
+            
+            obj.aif = AIFFromMask(concOfAifVoxels,data.MaskAIF);
+            
         end
-%         function Smodel = equation(obj, x)
-%             % Compute the Signal Model based on parameters x. 
-%             % x can be both a structure (FieldNames based on xnames) or a
-%             % vector (same order as xnames).
-%             x = struct2mat(x,obj.xnames);
-%             
-%             R10 = 1/x(4);
-%             S0 = 1e3;
-%             flipAngle = obj.Prot.SeqParam.Mat(1,1); % degrees
-%             TR = obj.Prot.SeqParam.Mat(1,2); % ms
-%             
-%             Tvec = obj.Prot.AIFAndTiming.Mat(:,1);
-%             Hct = obj.Prot.Constants.Mat(1,2);
-%             r1 = obj.Prot.Constants.Mat(2,2);
-%             
-%             KTrans = x(1); 
-%             kep = x(1)/x(2);% kep = KTrans/Ve
-%             Vb = x(3);
-%             
-%                         
-%             % % --- Convolution method adapted for variable time vectors
-%             % Evaluate IRF model for all ca time repeated for each ct time values
-%             dt = Tvec(end)-Tvec(end-1);
-%             dtVar = [(Tvec(2:end) - Tvec(1:(end-1))); dt];
-%             if any(dtVar - dt > 0.001)
-%                 warning('Convolution fails with variable time sampling. Although I don''t know exactly why... should be investigated.')
-%             end
-%             [tauM, timeM] = meshgrid(Tvec, Tvec);
-%             timeConvDiffM = timeM - tauM;
-%             
-%             biexpIrf = exp(-kep*timeConvDiffM); % (-)
-%             biexpIrf(timeConvDiffM<0) = 0;
-%             
-%             conc = biexpIrf*(aif.*dtVar)+Vb*aif;
-%             
-%             conc = KTrans*conc;
-%             
-%             % COMPUTE DATA SIGNAL
-%             R1 = r1*conc + R10;
-%             Smodel = S0*((1-exp(-TR.*R1))./(1-exp(-TR.*R1).*cos(flipAngle))).*sin(flipAngle);
-% 
-%         end
+        function Smodel = equation(obj, x)
+            % Compute the Signal Model based on parameters x. 
+            % x can be both a structure (FieldNames based on xnames) or a
+            % vector (same order as xnames).
+            x = struct2mat(x,obj.xnames);
+
+            % Compute concentration
+            % KTrans = x(1);
+            % Ve = x(2);
+            % Vb = x(3);
+            time = obj.Prot.DCEData.Mat(:,1);
+            conc = PKM_eTofts(x,time,obj.aif);
+            
+            % COMPUTE DATA SIGNAL
+            R10 = 1/x(4);
+            S0 = x(5);
+            flipAngleRad = obj.Prot.SeqParam.Mat(1,1)/180*pi; % degrees to radians
+            TR = obj.Prot.SeqParam.Mat(1,2); % s
+            
+            r1 = obj.Prot.Constants.Mat(2,2);
+            R1 = r1*conc + R10;
+            Smodel = S0*((1-exp(-TR.*R1))./(1-exp(-TR.*R1).*cos(flipAngleRad))).*sin(flipAngleRad);
+        end
         
         function FitResults = fit(obj,data)
             %  Fit data using model equation.
@@ -156,9 +142,9 @@ end
             
             relaxivity1 = obj.Prot.Constants.Mat(1,2);
             
-            [currentConc, ~] = ...
-                concandaif(data.DCEData, flipAngle, TR, data.T1Map, ...
-                [], relaxivity1, data.B1Map);
+            [currentConc, FitResults.S0] = ...
+                ConcFromSignal_SPGR(data.DCEData, flipAngle, TR, data.T1Map, ...
+                relaxivity1, data.B1Map); %Compute CA concentration of dynamic contrast enhanced SPGR data
             
             brainDensity = obj.Prot.Constants.Mat(1,3);
             [FitResults.KTrans, FitResults.Ve, FitResults.Vb, AIF] = ...
@@ -168,42 +154,41 @@ end
         end
         
         
-%         function plotModel(obj, FitResults, data)
-%             %  Plot the Model and Data.
-%             if nargin<2, qMRusage(obj,'plotModel'), FitResults=obj.st; end
-%             
-%             %Get fitted Model signal
-%             Smodel = equation(obj, FitResults);
-%             
-%             %Get the varying acquisition parameter
-%             Tvec = obj.Prot.Data4D.Mat(:,1); 
-%             [Tvec,Iorder] = sort(Tvec);
-%             
-%             % Plot Fitted Model
-%             plot(Tvec,Smodel(Iorder),'b-')
-%             
-%             % Plot Data
-%             if exist('data','var')
-%                 hold on
-%                 plot(Tvec,data.Data4D(Iorder),'r+')
-%                 hold off
-%             end
-%             legend({'Model','Data'})
-%         end
-%         
-%         function FitResults = Sim_Single_Voxel_Curve(obj, x, Opt, display)
-%             % Compute Smodel
-%             Smodel = equation(obj, x);
-%             % add rician noise
-%             sigma = max(Smodel)/Opt.SNR;
-%             data.Data4D = random('rician',Smodel,sigma);
-%             % fit the noisy synthetic data
-%             FitResults = fit(obj,data);
-%             % plot
-%             if display
-%                 plotModel(obj, FitResults, data);
-%             end
-%         end
+        function plotModel(obj, FitResults, data)
+            %  Plot the Model and Data.
+            if nargin<2, qMRusage(obj,'plotModel'), FitResults=obj.st; end
+            
+            %Get fitted Model signal
+            Smodel = equation(obj, FitResults);
+            
+            %Get the varying acquisition parameter
+            Tvec = obj.Prot.DCEData.Mat(:,1);
+            
+            % Plot Fitted Model
+            plot(Tvec,Smodel,'b-')
+            
+            % Plot Data
+            if exist('data','var')
+                hold on
+                plot(Tvec,data.DCEData,'r+')
+                hold off
+            end
+            legend({'Model','Data'})
+        end
+        
+        function FitResults = Sim_Single_Voxel_Curve(obj, x, Opt, display)
+            % Compute Smodel
+            Smodel = equation(obj, x);
+            % add rician noise
+            sigma = max(Smodel)/Opt.SNR;
+            data.Data4D = random('rician',Smodel,sigma);
+            % fit the noisy synthetic data
+            FitResults = fit(obj,data);
+            % plot
+            if display
+                plotModel(obj, FitResults, data);
+            end
+        end
 
     end
 end
